@@ -28,12 +28,64 @@ La versión V1 sigue intacta en memoria, así que cualquier hilo que la esté le
 
 ## Estructura interna: árboles Trie con compresión de bits
 
-Para que estas operaciones no se vuelvan lentas, Clojure implementa internamente árboles con un factor de ramificación de 32, es decir, cada nodo puede tener hasta 32 ramas.
+Para que estas operaciones no se vuelvan lentas, Clojure implementa internamente árboles con un factor de ramificación de 32, es decir, cada nodo puede tener hasta 32 ramas. En los **vectores** el índice se divide en grupos de 5 bits (2⁵ = 32) y cada grupo elige la rama en un nivel del árbol (*bit-partitioned vector trie*); en los **mapas y conjuntos** se usa la misma idea sobre el *hash* de la llave (*Hash Array Mapped Trie*, HAMT, propuesto por Phil Bagwell [3]).
 
-Esto tiene un efecto interesante: con solo 6 niveles de profundidad, un árbol de este tipo puede almacenar hasta 32⁶, poco más de mil millones de elementos. Como consecuencia, buscar o "modificar" un elemento nunca toma más de 6 saltos entre nodos, sin importar qué tan grande sea la colección.
-En la práctica eso se comporta casi como si el tiempo de acceso fuera constante.
+Esto tiene un efecto interesante: con solo 6 niveles de profundidad, un árbol de este tipo puede almacenar hasta 32⁶, poco más de mil millones de elementos. Como consecuencia, buscar o "modificar" un elemento en una colección de ese tamaño toma a lo más 6 saltos entre nodos.
+Formalmente el costo es O(log₃₂ n): no es constante, pero crece tan despacio que en la práctica se comporta casi como si lo fuera.
 
 Cuando se modifica un elemento, solo se duplican los nodos que están en el camino entre la raíz y el elemento en cuestión; todo lo demás del árbol se mantiene compartido entre las distintas versiones. A esta técnica se le conoce como copia de camino.
+
+## Verificación en Clojure (REPL)
+
+> *Sección agregada durante la revisión docente para respaldar con código ejecutable las afirmaciones anteriores. Probado con Clojure 1.12 (`clojure -M archivo.clj`).*
+
+```clojure
+;; 1. "Modificar" un vector devuelve una versión nueva; la original no cambia
+(def v1 [:a :b :c])
+(def v2 (assoc v1 0 :d))
+(println "v1 =" v1 " v2 =" v2)            ; v1 = [:a :b :c]  v2 = [:d :b :c]
+
+;; 2. Compartición de estructura en listas: la cola es el MISMO objeto
+(def l1 '(:b :c))
+(def l2 (cons :a l1))
+(println "comparte cola?" (identical? l1 (rest l2)))   ; true
+
+;; 3. Copia de camino en un vector grande: solo cambia la ruta raíz→hoja
+(def grande (vec (range 1000000)))
+(def grande2 (assoc grande 999999 :x))
+(println "original intacto:" (peek grande) " nueva versión:" (peek grande2))
+;; original intacto: 999999  nueva versión: :x
+
+;; 4. Historial de versiones barato (deshacer)
+(def historial (reductions conj [] [1 2 3]))
+(println "versiones:" historial)           ; ([] [1] [1 2] [1 2 3])
+```
+
+El ejemplo 2 es exactamente el diagrama V1/V2 de arriba: `identical?` compara referencias, no contenido, y devuelve `true` porque `l2` no copió `(:b :c)`, apunta a la misma lista. El ejemplo 3 "modifica" un vector de un millón de elementos creando solo los ~4 nodos del camino (log₃₂ 1 000 000 ≈ 4), no un millón de copias.
+
+### ¿Y si sí necesito estado que cambie?
+
+La inmutabilidad no elimina el estado: lo **aísla** en referencias explícitas que apuntan a valores inmutables. Clojure ofrece `atom` para un solo valor y `ref` + `dosync` (memoria transaccional por software, STM) cuando varios valores deben cambiar de forma coordinada:
+
+```clojure
+;; atom: un solo valor, actualización atómica
+(def contador (atom {:visitas 0}))
+(swap! contador update :visitas inc)
+(println "atom:" @contador)                ; atom: {:visitas 1}
+
+;; ref + dosync: dos cuentas que deben cambiar juntas o no cambiar
+(def cuenta-a (ref 1000))
+(def cuenta-b (ref 0))
+(dosync
+  (alter cuenta-a - 250)
+  (alter cuenta-b + 250))
+(println "ref: A =" @cuenta-a " B =" @cuenta-b " total =" (+ @cuenta-a @cuenta-b))
+;; ref: A = 750  B = 250  total = 1000
+```
+
+Si otra transacción modifica `cuenta-a` al mismo tiempo, `dosync` reintenta la transacción completa; ningún hilo puede observar un estado intermedio en el que el dinero "desapareció". Esto funciona porque cada versión de las cuentas es un valor persistente: reintentar es barato y las versiones anteriores siguen siendo válidas para quien las esté leyendo.
+
+**Caso real:** Nubank, el banco digital más grande de Latinoamérica, construyó su plataforma en Clojure sobre Datomic, una base de datos que lleva la misma idea a disco: los hechos nunca se sobrescriben, se acumulan, y cualquier versión anterior de la base puede consultarse [5]. El ejemplo de las cuentas modela el tipo de problema (transferencias que deben ser consistentes) que motiva ese diseño.
 
 ## Ventajas principales
 
@@ -54,3 +106,8 @@ Me llamó la atención sobre todo la parte de los árboles de 32 ramas, porque e
 
 *[2] Academia Lab, "Estructura de datos persistente," Enciclopedia Academia Lab, s.f. [En línea]. Disponible en: https://academia-lab.com/enciclopedia/estructura-de-datos-persistente/. [Accedido: 13-sep-2026].
 
+*[3] P. Bagwell, "Ideal Hash Trees," École Polytechnique Fédérale de Lausanne (EPFL), Tech. Rep. LAMP-REPORT-2001-001, 2001.
+
+*[4] R. Hickey, "Data Structures," Clojure Reference. [En línea]. Disponible en: https://clojure.org/reference/data_structures. [Accedido: 24-sep-2026].
+
+*[5] Nubank, "Clojure" (artículos etiquetados), Building Nubank — blog de ingeniería. [En línea]. Disponible en: https://building.nubank.com/tag/clojure/. [Accedido: 24-sep-2026].
